@@ -22,11 +22,11 @@ def get_session():
     wd = now.weekday()
     if wd == 5:
         if mins >= 1080:
-            return {"name":"Futuros /ES Sabado noche","active":True,"type":"futures","bonus":0,"min_score":80}
+            return {"name":"Futuros ES Sabado noche","active":True,"type":"futures","bonus":0,"min_score":80}
         return {"name":"Mercado cerrado Sabado","active":False,"type":"closed","bonus":-50,"min_score":999}
     if wd == 6:
         if mins >= 1080:
-            return {"name":"Futuros /ES Domingo noche","active":True,"type":"futures","bonus":5,"min_score":78}
+            return {"name":"Futuros ES Domingo noche","active":True,"type":"futures","bonus":5,"min_score":78}
         return {"name":"Mercado cerrado Domingo","active":False,"type":"closed","bonus":-50,"min_score":999}
     if 0 <= mins < 240:
         return {"name":"Futuros Overnight","active":True,"type":"futures","bonus":-5,"min_score":82}
@@ -50,13 +50,33 @@ def get_session():
         return {"name":"Futuros Noche","active":True,"type":"futures","bonus":0,"min_score":80}
     return {"name":"Fuera de mercado","active":False,"type":"closed","bonus":-50,"min_score":999}
 
+def get_price_yahoo(symbol):
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=10).json()
+        price = r["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        prev  = r["chart"]["result"][0]["meta"]["chartPreviousClose"]
+        return float(price), float(prev)
+    except:
+        return None, None
+
 def get_spy_price():
     try:
         url = f"https://api.polygon.io/v2/last/trade/SPY?apiKey={POLYGON_KEY}"
         r = requests.get(url, timeout=10).json()
-        return float(r["results"]["p"])
+        p = float(r["results"]["p"])
+        if p > 0:
+            print(f"SPY via Polygon: ${p}")
+            return p
     except:
-        return None
+        pass
+    price, _ = get_price_yahoo("SPY")
+    if price:
+        print(f"SPY via Yahoo: ${price}")
+        return price
+    print("ERROR: No se pudo obtener precio SPY")
+    return None
 
 def get_vix():
     try:
@@ -64,7 +84,9 @@ def get_vix():
         r = requests.get(url, timeout=10).json()
         return float(r["results"]["p"])
     except:
-        return 18.0
+        pass
+    price, _ = get_price_yahoo("^VIX")
+    return price if price else 18.0
 
 def get_es_data():
     try:
@@ -75,9 +97,17 @@ def get_es_data():
         r2 = requests.get(url2, timeout=10).json()
         prev = float(r2["results"][0]["c"])
         chg = round((price - prev) / prev * 100, 2)
+        print(f"ES via Polygon: ${price} ({chg:+.2f}%)")
         return {"price": price, "change_pct": chg, "bullish": chg > 0.15}
     except:
-        return {"price": 0, "change_pct": 0, "bullish": False}
+        pass
+    price, prev = get_price_yahoo("ES=F")
+    if price and prev and prev > 0:
+        chg = round((price - prev) / prev * 100, 2)
+        print(f"ES via Yahoo: ${price} ({chg:+.2f}%)")
+        return {"price": price, "change_pct": chg, "bullish": chg > 0.15}
+    print("ERROR: No se pudo obtener datos ES")
+    return {"price": 7380, "change_pct": 0, "bullish": False}
 
 def get_best_option(spy_price, direction):
     try:
@@ -114,11 +144,12 @@ def claude_analysis(spy_price, es_data, vix, session):
         instrument = f"SPY ${spy_price}"
         context = "Analiza SPY con todas las capas del metodo Infusion."
     prompt = f"""Eres experto en tape reading metodo Victor Gonzalez Infusion Investments. Vigilas 24/7.
-DATOS: Instrumento={instrument} SPY=${spy_price} ES=${es_data['price']} ({es_data['change_pct']:+.2f}%) VIX={vix} Sesion={session['name']}
+DATOS: Instrumento={instrument} SPY=${spy_price} ES={es_data['price']} ({es_data['change_pct']:+.2f}%) VIX={vix} Sesion={session['name']}
 {context}
-Aplica tape reading: UA sweeps/blocks, delta bid/ask, ES direccion, GEX MaxPain, estructura HH/HL o LH/LL, VIX, ventana probabilidad, doble confirmacion, volumen.
-Solo LONG o SHORT con evidencia real de ballenas. Sin unusual activity clara devuelve WAIT o NONE.
-Responde SOLO JSON sin texto extra: {{"direction":"LONG o SHORT o WAIT o NONE","score":0-100,"ua_detected":true,"es_bullish":true,"layers_passed":0-9,"vix_ok":true,"reason":"max 20 palabras"}}"""
+Aplica tape reading: UA sweeps/blocks institucionales, delta bid/ask agresividad, ES direccion institucional, GEX MaxPain, estructura HH/HL o LH/LL, VIX filtro, ventana probabilidad, doble confirmacion, volumen institucional.
+Solo LONG o SHORT con evidencia real de ballenas y unusual activity. Sin UA clara devuelve WAIT o NONE.
+Responde SOLO JSON sin texto extra ni backticks:
+{{"direction":"LONG o SHORT o WAIT o NONE","score":0-100,"ua_detected":true,"es_bullish":true,"layers_passed":0-9,"vix_ok":true,"reason":"max 20 palabras"}}"""
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -128,8 +159,11 @@ Responde SOLO JSON sin texto extra: {{"direction":"LONG o SHORT o WAIT o NONE","
         )
         text = r.json()["content"][0]["text"]
         text = text.replace("```json","").replace("```","").strip()
-        return json.loads(text)
+        result = json.loads(text)
+        print(f"Claude: Dir={result.get('direction')} Score={result.get('score')} Layers={result.get('layers_passed')} Reason={result.get('reason')}")
+        return result
     except Exception as e:
+        print(f"Error Claude: {e}")
         return {"direction":"NONE","score":0,"layers_passed":0,"ua_detected":False,"reason":f"Error: {e}"}
 
 def calc_risk(spy_price, direction, option):
@@ -148,7 +182,8 @@ def calc_risk(spy_price, direction, option):
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID,"text": msg,"parse_mode": "HTML"}, timeout=10)
+        requests.post(url, json={"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"HTML"}, timeout=10)
+        print("Telegram OK")
     except Exception as e:
         print(f"Error Telegram: {e}")
 
@@ -170,8 +205,9 @@ Prima total <code>${risk['prima']}</code> = 1% de $50,000
 Ganancia P1 <code>+${risk['gain1']}</code> · P2 <code>+${risk['gain2']}</code>
 Confianza <b>{score}/100</b> · {analysis['layers_passed']}/9 capas
 
-/ES <code>${es_data['price']} ({es_data['change_pct']:+.2f}%)</code>
-VIX <code>{vix}</code> · {session['name']}"""
+ES <code>${es_data['price']} ({es_data['change_pct']:+.2f}%)</code>
+VIX <code>{vix}</code> · {session['name']}
+Razon: {analysis.get('reason','')}"""
 
 last_direction = "NONE"
 confirm_count = 0
@@ -187,11 +223,13 @@ def run_cycle():
         return
     spy = get_spy_price()
     if not spy:
+        print(f"[{now_str}] ERROR precio no disponible")
         return
     vix = get_vix()
     es = get_es_data()
+    print(f"[{now_str}] SPY=${spy} ES=${es['price']} VIX={vix}")
     if vix > 35:
-        send_telegram("🚨 <b>VIX > 35 MERCADO EN PANICO</b>\nBot congelado. Protege el fondeo.")
+        send_telegram("🚨 <b>VIX > 35</b>\nBot congelado. Protege el fondeo.")
         return
     analysis = claude_analysis(spy, es, vix, session)
     direction = analysis.get("direction", "NONE")
@@ -199,8 +237,8 @@ def run_cycle():
     min_score = session["min_score"]
     if vix > 25: min_score = max(min_score, 85)
     elif vix > 15: min_score = max(min_score, 78)
-    print(f"[{now_str}] SPY ${spy} | ES ${es['price']} | Score {score} | Dir {direction} | VIX {vix}")
-    if direction == last_direction and direction in ["LONG", "SHORT"]:
+    print(f"[{now_str}] Score={score} Dir={direction} Min={min_score} Confirm={confirm_count}")
+    if direction == last_direction and direction in ["LONG","SHORT"]:
         confirm_count += 1
     else:
         confirm_count = 1
@@ -214,17 +252,17 @@ def run_cycle():
             send_telegram(msg)
             last_signal_time = now_ts
             confirm_count = 0
-            print(f"[{now_str}] SENAL ENVIADA: {direction} score {score}")
+            print(f"[{now_str}] SENAL ENVIADA: {direction} score={score}")
         else:
             print(f"[{now_str}] Anti-spam activo")
     elif direction in ["LONG","SHORT"] and confirm_count == 1:
-        print(f"[{now_str}] Ciclo 1 confirmado ({score}) esperando ciclo 2")
+        print(f"[{now_str}] Ciclo 1 OK score={score} esperando ciclo 2")
     else:
-        print(f"[{now_str}] Sin senal score {score} bajo umbral {min_score}")
+        print(f"[{now_str}] Sin senal score={score} umbral={min_score}")
 
 if __name__ == "__main__":
-    print("SPY Bot v3 Infusion Method 24/7 Iniciando...")
-    send_telegram("🤖 <b>SPY Bot v3 — 24/7 Activado</b>\nMetodo Infusion · 9 capas · Fondeo $50K\n🐋 Vigilando el tape las 24 horas...")
+    print("SPY Bot v3 Infusion 24/7 Iniciando...")
+    send_telegram("🤖 <b>SPY Bot v3 — Yahoo+Polygon 24/7</b>\n🐋 Vigilando tape ahora...")
     while True:
         try:
             run_cycle()
